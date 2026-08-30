@@ -108,6 +108,7 @@ cp .env.example .env
 
 ```
 NETEASE_COOKIE=MUSIC_U=你的值; __csrf=你的值
+NETEASE_SERVICE_TOKEN=生成一枚长随机值
 MCP_PORT=3456
 ```
 
@@ -129,7 +130,33 @@ python3 server.py
 http://你的服务器IP:3456/mcp
 ```
 
-应该显示 9 个工具已连接。
+客户端请求需要携带：
+
+```
+Authorization: Bearer <NETEASE_SERVICE_TOKEN>
+```
+
+这不是第二套网易云登录；MCP 与 `/v1/*` 结构化读取仍共用同一个
+`NETEASE_COOKIE`。连接后应该显示 9 个工具。
+
+旧客户端若仍使用 `GET /sse` + `POST /message`，入口继续保留，但同样必须
+携带 `Authorization: Bearer <NETEASE_SERVICE_TOKEN>`；新接入统一使用 `/mcp`。
+
+### 小窝结构化读取
+
+同一进程额外提供窄的 authenticated JSON surface，供小窝 Worker
+server-to-server 调用：
+
+- `GET /v1/account`
+- `GET /v1/history?limit=30&period=week`
+- `GET /v1/playlists?limit=50&offset=0`
+- `GET /v1/playlists/:id?limit=100&offset=0`
+- `GET /v1/recommendations/daily`
+- `GET /v1/search?q=...&limit=20&offset=0`
+
+这些接口只返回账号资料、真实播放历史、歌单、歌曲元数据、喜欢状态和
+每日推荐；不返回 Cookie，不代理音频，也不保存网易云数据库副本。Web
+首版不开放写操作，建歌单、加歌、删歌和红心继续由现有 MCP 工具承担。
 
 ---
 
@@ -163,6 +190,7 @@ Zeabur部署：
 
    - `MCP_PORT` = `8080`（Zeabur默认暴露这个）
    - `NETEASE_COOKIE` = `MUSIC_U=你的值; __csrf=你的值`
+   - `NETEASE_SERVICE_TOKEN` = `生成一枚长随机值`
 
 5. 端口设置里暴露 `8080`，协议选 HTTP
 
