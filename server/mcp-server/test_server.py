@@ -25,9 +25,10 @@ def song(song_id=11, name="歌", liked=True):
 
 
 class FakeUpstream:
-    def __init__(self, empty=False, expired=False):
+    def __init__(self, empty=False, expired=False, modern_error=False):
         self.empty = empty
         self.expired = expired
+        self.modern_error = modern_error
         self.urls = []
 
     def __call__(self, url, data=None):
@@ -48,6 +49,12 @@ class FakeUpstream:
             return {"code": 200, "data": {"dailySongs": [] if self.empty else [{**song(), "reason": "猜你喜欢"}]}}
         if "search/get" in url:
             return {"code": 200, "result": {"songs": [] if self.empty else [song()], "songCount": 0 if self.empty else 1}}
+        if "enhance/player/url/v1" in url:
+            if self.modern_error:
+                return {"code": 500}
+            if self.empty:
+                return {"code": 200, "data": [{"id": 11, "url": None, "br": 0, "expi": 0, "type": None, "level": "standard"}]}
+            return {"code": 200, "data": [{"id": 11, "url": "https://m801.music.126.net/v1.mp3", "br": 128000, "expi": 1200, "type": "mp3", "level": "standard"}]}
         if "enhance/player/url" in url:
             if self.empty:
                 return {"code": 200, "data": [{"id": 11, "url": None, "br": 0, "expi": 0}]}
@@ -72,8 +79,26 @@ class StructuredMusicTests(unittest.TestCase):
         self.assertTrue(any("/api/song/like/get?uid=7" in url for url, _ in upstream.urls))
         play = api.play_source(11)
         self.assertTrue(play["url"].startswith("https://"))
+        self.assertEqual(play["source_kind"], "v1")
+        self.assertEqual(play["format"], "mp3")
+        self.assertEqual(play["level"], "standard")
+        modern = [(url, data) for url, data in upstream.urls if "enhance/player/url/v1" in url]
+        self.assertEqual(len(modern), 1)
+        self.assertEqual(modern[0][1]["level"], "standard")
+        self.assertEqual(modern[0][1]["encodeType"], "mp3")
+        self.assertEqual(modern[0][1]["ids"], "[11]")
         self.assertNotIn("MUSIC_U", json.dumps(play))
         self.assertEqual(api.lyric(11)["lines"][0]["text"], "窗前")
+
+    def test_modern_player_url_failure_falls_back_to_legacy_source(self):
+        upstream = FakeUpstream(modern_error=True)
+        play = music_server.NetEaseMusic(upstream).play_source(11)
+        self.assertEqual(play["source_kind"], "legacy")
+        self.assertEqual(play["url"], "https://m801.music.126.net/x.mp3")
+        play_calls = [(url, data) for url, data in upstream.urls if "enhance/player/url" in url]
+        self.assertEqual(len(play_calls), 2)
+        self.assertIn("/url/v1", play_calls[0][0])
+        self.assertIn("br=320000", play_calls[1][0])
 
     def test_empty_lists_are_successful_empty_arrays(self):
         api = music_server.NetEaseMusic(FakeUpstream(empty=True))
@@ -124,7 +149,7 @@ class StubMusic:
     def recommendations(self): return {"songs": []}
     def search(self, query, limit, offset): return {"songs": [], "song_count": 0, "limit": limit, "offset": offset}
     def song(self, song_id): return {"id": song_id, "name": "歌", "artists": ["歌手"], "album": "专辑", "cover_url": "", "duration_ms": 1000, "liked": False}
-    def play_source(self, song_id): return {"track_id": song_id, "url": "https://cdn.example/x.mp3", "bitrate": 320000, "expire_seconds": 1200, "song": self.song(song_id)}
+    def play_source(self, song_id): return {"track_id": song_id, "url": "https://cdn.example/x.mp3", "bitrate": 128000, "expire_seconds": 1200, "format": "mp3", "level": "standard", "source_kind": "v1", "song": self.song(song_id)}
     def lyric(self, song_id): return {"track_id": song_id, "lyric": None, "translated_lyric": None, "lines": []}
 
 
