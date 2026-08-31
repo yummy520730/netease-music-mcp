@@ -1,687 +1,348 @@
 #!/usr/bin/env python3
-"""NetEase Music MCP plus a narrow authenticated JSON read surface."""
+"""NetEase Music MCP entrypoint with EAPI playback and signed no-referrer redirects."""
 
 from __future__ import annotations
 
+import hashlib
 import hmac
-import http.server
+import importlib
 import json
 import os
+import random
 import re
 import sys
-import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-import uuid
-from datetime import datetime, timezone
-from http.server import HTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from listening import ListeningError, ListeningStore, parse_lrc
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+_core = importlib.import_module("server_core")
 
-NETEASE_COOKIE = os.environ.get("NETEASE_COOKIE", "").strip()
-NETEASE_SERVICE_TOKEN = os.environ.get("NETEASE_SERVICE_TOKEN", "").strip()
-PORT = int(os.environ.get("MCP_PORT", "3456"))
-SESSION_ID = str(uuid.uuid4())
-MAX_REQUEST_BYTES = 64 * 1024
+_AES_KEY = b"e82ckenh8dichen8"
+_AUDIO_TTL_SECONDS = 120
+_AUDIO_MAX_FUTURE_SECONDS = 300
+_AUDIO_PATH_RE = re.compile(r"^/v1/audio/([1-9][0-9]{0,19})/([0-9]{10})/([0-9a-f]{32})$")
+_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+(?::[0-9]{1,5})?$")
+_CDN_RE = re.compile(r"^m([0-9]+)\.music\.126\.net$", re.IGNORECASE)
+
+_SBOX = (
+0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16,
+)
+_RCON = (0x00,0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36)
 
 
-class MusicError(Exception):
-    def __init__(self, status: int, message: str):
-        super().__init__(message)
-        self.status = status
-        self.message = message
+def _xtime(value: int) -> int:
+    return (((value << 1) ^ 0x1B) & 0xFF) if value & 0x80 else ((value << 1) & 0xFF)
 
 
-def netease_request(url: str, data: dict[str, Any] | str | None = None) -> dict[str, Any]:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://music.163.com/",
-        "Cookie": NETEASE_COOKIE,
-        "Content-Type": "application/x-www-form-urlencoded" if data is not None else "application/json",
+def _aes_expand(key: bytes) -> list[list[int]]:
+    if len(key) != 16:
+        raise ValueError("AES-128 key required")
+    words = [list(key[index:index + 4]) for index in range(0, 16, 4)]
+    for index in range(4, 44):
+        temp = words[index - 1][:]
+        if index % 4 == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [_SBOX[value] for value in temp]
+            temp[0] ^= _RCON[index // 4]
+        words.append([words[index - 4][offset] ^ temp[offset] for offset in range(4)])
+    return [sum(words[index * 4:(index + 1) * 4], []) for index in range(11)]
+
+
+def _aes_add(state: list[int], round_key: list[int]) -> None:
+    for index in range(16):
+        state[index] ^= round_key[index]
+
+
+def _aes_sub(state: list[int]) -> None:
+    for index in range(16):
+        state[index] = _SBOX[state[index]]
+
+
+def _aes_shift(state: list[int]) -> None:
+    previous = state[:]
+    for row in range(4):
+        for column in range(4):
+            state[4 * column + row] = previous[4 * ((column + row) % 4) + row]
+
+
+def _aes_mix(state: list[int]) -> None:
+    for column in range(4):
+        index = 4 * column
+        values = state[index:index + 4]
+        total = values[0] ^ values[1] ^ values[2] ^ values[3]
+        first = values[0]
+        state[index] = values[0] ^ total ^ _xtime(values[0] ^ values[1])
+        state[index + 1] = values[1] ^ total ^ _xtime(values[1] ^ values[2])
+        state[index + 2] = values[2] ^ total ^ _xtime(values[2] ^ values[3])
+        state[index + 3] = values[3] ^ total ^ _xtime(values[3] ^ first)
+
+
+def _aes_encrypt_block(block: bytes, key: bytes) -> bytes:
+    if len(block) != 16:
+        raise ValueError("AES block must be 16 bytes")
+    state = list(block)
+    round_keys = _aes_expand(key)
+    _aes_add(state, round_keys[0])
+    for round_index in range(1, 10):
+        _aes_sub(state)
+        _aes_shift(state)
+        _aes_mix(state)
+        _aes_add(state, round_keys[round_index])
+    _aes_sub(state)
+    _aes_shift(state)
+    _aes_add(state, round_keys[10])
+    return bytes(state)
+
+
+def _aes_ecb_encrypt(data: bytes, key: bytes) -> bytes:
+    if len(data) % 16:
+        raise ValueError("AES ECB input must align to 16 bytes")
+    return b"".join(_aes_encrypt_block(data[index:index + 16], key) for index in range(0, len(data), 16))
+
+
+def _pkcs7(data: bytes) -> bytes:
+    padding = 16 - (len(data) % 16)
+    return data + bytes([padding]) * padding
+
+
+def _cookie_value(name: str) -> str:
+    for part in _core.NETEASE_COOKIE.split(";"):
+        key, separator, value = part.strip().partition("=")
+        if separator and key == name:
+            return value
+    return ""
+
+
+def _eapi_cipher(api_path: str, query_body: dict[str, Any], cookies: dict[str, str]) -> bytes:
+    request_text = json.dumps({**query_body, "header": cookies}, separators=(",", ":"))
+    message = f"nobody{api_path}use{request_text}md5forencrypt".encode("latin1")
+    digest = hashlib.md5(message).hexdigest()
+    plaintext = f"{api_path}-36cd479b6b5-{request_text}-36cd479b6b5-{digest}".encode("latin1")
+    encrypted = _aes_ecb_encrypt(_pkcs7(plaintext), _AES_KEY)
+    return b"params=" + encrypted.hex().upper().encode("ascii")
+
+
+def _eapi_json(path: str, query_body: dict[str, Any]) -> dict[str, Any]:
+    music_u = _cookie_value("MUSIC_U")
+    cookies = {
+        "osver": "undefined",
+        "deviceId": "undefined",
+        "appver": "8.0.0",
+        "versioncode": "140",
+        "mobilename": "undefined",
+        "buildver": "1623435496",
+        "resolution": "1920x1080",
+        "__csrf": "",
+        "os": "pc",
+        "channel": "undefined",
+        "requestId": f"{int(time.time() * 1000)}_{random.randint(0, 1000):04}",
     }
-    if isinstance(data, dict):
-        encoded = urllib.parse.urlencode(data).encode()
-    elif isinstance(data, str):
-        encoded = data.encode()
-    else:
-        encoded = None
-    request = urllib.request.Request(url, data=encoded, headers=headers)
+    if music_u:
+        cookies["MUSIC_U"] = music_u
+    api_path = "/api" + path
+    request = urllib.request.Request(
+        "https://interface3.music.163.com/eapi" + path,
+        data=_eapi_cipher(api_path, query_body, cookies),
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://music.163.com",
+            "Cookie": "; ".join(f"{key}={value}" for key, value in cookies.items()),
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             payload = response.read(3 * 1024 * 1024 + 1)
             if len(payload) > 3 * 1024 * 1024:
-                raise MusicError(502, "NetEase response is too large")
+                raise _core.MusicError(502, "NetEase response is too large")
             parsed = json.loads(payload.decode("utf-8"))
             if not isinstance(parsed, dict):
-                raise MusicError(502, "NetEase returned an invalid response")
+                raise _core.MusicError(502, "NetEase returned an invalid response")
             return parsed
-    except MusicError:
+    except _core.MusicError:
         raise
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise MusicError(502, "NetEase request failed") from error
+        raise _core.MusicError(502, "NetEase EAPI request failed") from error
 
 
-def _upstream_ok(payload: dict[str, Any], *, require_profile: bool = False) -> dict[str, Any]:
-    code = payload.get("code")
-    if code in (301, 302, 401, -460) or (require_profile and not payload.get("profile")):
-        raise MusicError(401, "NetEase account session is unavailable")
-    if code not in (None, 200):
-        raise MusicError(502, "NetEase returned an error")
-    return payload
-
-
-def _artist_names(song: dict[str, Any]) -> list[str]:
-    artists = song.get("ar") or song.get("artists") or []
-    return [str(item.get("name", "")) for item in artists if isinstance(item, dict) and item.get("name")]
-
-
-def _album(song: dict[str, Any]) -> dict[str, Any]:
-    album = song.get("al") or song.get("album") or {}
-    return album if isinstance(album, dict) else {}
-
-
-def _song_view(
-    song: dict[str, Any],
-    liked_ids: set[int] | None = None,
-    *,
-    play_count: int | None = None,
-    score: int | None = None,
-    reason: str | None = None,
-) -> dict[str, Any]:
-    album = _album(song)
-    song_id = int(song.get("id") or 0)
-    value = {
-        "id": song_id,
-        "name": str(song.get("name") or ""),
-        "artists": _artist_names(song),
-        "album": str(album.get("name") or ""),
-        "cover_url": str(album.get("picUrl") or ""),
-        "duration_ms": int(song.get("dt") or song.get("duration") or 0),
-        "liked": song_id in (liked_ids or set()),
-    }
-    if play_count is not None:
-        value["play_count"] = play_count
-    if score is not None:
-        value["score"] = score
-    if reason:
-        value["reason"] = reason
+def _browser_cdn_url(raw: str) -> str:
+    value = raw.replace("http://", "https://", 1) if raw.startswith("http://") else raw
+    parsed = urllib.parse.urlsplit(value)
+    hostname = (parsed.hostname or "").lower()
+    match = _CDN_RE.fullmatch(hostname)
+    if match:
+        compatible_host = f"m{match.group(1)}c.music.126.net"
+        port = f":{parsed.port}" if parsed.port else ""
+        parsed = parsed._replace(netloc=compatible_host + port)
+        return urllib.parse.urlunsplit(parsed)
     return value
 
 
-class NetEaseMusic:
-    """Structured operations backed by the same request function as MCP tools."""
-
-    def __init__(self, request: Callable[..., dict[str, Any]] = netease_request):
-        self.request = request
-
-    def account(self) -> dict[str, Any]:
-        payload = _upstream_ok(self.request("https://music.163.com/api/nuser/account/get"), require_profile=True)
-        profile = payload["profile"]
-        account = payload.get("account") or {}
-        return {
-            "user_id": int(profile.get("userId") or account.get("id") or 0),
-            "nickname": str(profile.get("nickname") or ""),
-            "avatar_url": str(profile.get("avatarUrl") or ""),
-            "signature": str(profile.get("signature") or ""),
-            "follows": int(profile.get("follows") or 0),
-            "followeds": int(profile.get("followeds") or 0),
-            "playlist_count": int(profile.get("playlistCount") or 0),
-            "vip_type": int(profile.get("vipType") or account.get("vipType") or 0),
-        }
-
-    def liked_ids(self, user_id: int | None = None) -> set[int]:
-        uid = user_id or self.account()["user_id"]
-        query = urllib.parse.urlencode({"uid": uid})
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/song/like/get?{query}"))
-        return {int(value) for value in payload.get("ids", []) if str(value).isdigit()}
-
-    def playlists(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
-        account = self.account()
-        query = urllib.parse.urlencode({"uid": account["user_id"], "limit": limit, "offset": offset})
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/user/playlist?{query}"))
-        values = []
-        for item in payload.get("playlist") or []:
-            creator = item.get("creator") or {}
-            values.append({
-                "id": int(item.get("id") or 0),
-                "name": str(item.get("name") or ""),
-                "cover_url": str(item.get("coverImgUrl") or ""),
-                "description": str(item.get("description") or ""),
-                "track_count": int(item.get("trackCount") or 0),
-                "play_count": int(item.get("playCount") or 0),
-                "owned": int(creator.get("userId") or 0) == account["user_id"],
-                "subscribed": bool(item.get("subscribed")),
-                "updated_at_ms": int(item.get("updateTime") or 0),
-            })
-        return {"playlists": values, "more": bool(payload.get("more")), "offset": offset, "limit": limit}
-
-    def playlist(self, playlist_id: int, limit: int = 100, offset: int = 0) -> dict[str, Any]:
-        query = urllib.parse.urlencode({"id": playlist_id})
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/v6/playlist/detail?{query}"))
-        playlist = payload.get("playlist") or {}
-        if not playlist:
-            raise MusicError(404, "playlist not found")
-        track_ids = [int(item.get("id")) for item in playlist.get("trackIds") or [] if str(item.get("id", "")).isdigit()]
-        page_ids = track_ids[offset:offset + limit]
-        present = {int(item.get("id") or 0): item for item in playlist.get("tracks") or []}
-        missing = [song_id for song_id in page_ids if song_id not in present]
-        if missing:
-            encoded_ids = urllib.parse.quote(json.dumps(missing, separators=(",", ":")))
-            detail = _upstream_ok(self.request(f"https://music.163.com/api/song/detail?ids={encoded_ids}"))
-            present.update({int(item.get("id") or 0): item for item in detail.get("songs") or []})
-        tracks = (playlist.get("tracks") or [])[offset:offset + limit] if not track_ids else [present[song_id] for song_id in page_ids if song_id in present]
-        liked = self.liked_ids()
-        creator = playlist.get("creator") or {}
-        return {
-            "playlist": {
-                "id": int(playlist.get("id") or playlist_id),
-                "name": str(playlist.get("name") or ""),
-                "cover_url": str(playlist.get("coverImgUrl") or ""),
-                "description": str(playlist.get("description") or ""),
-                "track_count": int(playlist.get("trackCount") or len(track_ids)),
-                "play_count": int(playlist.get("playCount") or 0),
-                "creator": str(creator.get("nickname") or ""),
-                "subscribed": bool(playlist.get("subscribed")),
-            },
-            "songs": [_song_view(item, liked) for item in tracks],
-            "offset": offset,
-            "limit": limit,
-            "more": offset + len(tracks) < int(playlist.get("trackCount") or len(track_ids)),
-        }
-
-    def history(self, limit: int = 30, all_time: bool = False) -> dict[str, Any]:
-        account = self.account()
-        query = urllib.parse.urlencode({"uid": account["user_id"], "type": 0 if all_time else 1})
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/v1/play/record?{query}"))
-        records = (payload.get("allData") if all_time else payload.get("weekData")) or []
-        liked = self.liked_ids(account["user_id"])
-        songs = [
-            _song_view(item.get("song") or {}, liked, play_count=int(item.get("playCount") or 0), score=int(item.get("score") or 0))
-            for item in records[:limit]
-        ]
-        return {"songs": songs, "period": "all" if all_time else "week", "limit": limit}
-
-    def recommendations(self) -> dict[str, Any]:
-        query = urllib.parse.urlencode({"csrf_token": get_csrf()})
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/v3/discovery/recommend/songs?{query}", data="{}"))
-        liked = self.liked_ids()
-        songs = [_song_view(item, liked, reason=str(item.get("reason") or "")) for item in (payload.get("data") or {}).get("dailySongs") or []]
-        return {"songs": songs[:30]}
-
-    def search(self, query_text: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
-        query = urllib.parse.urlencode({"s": query_text, "type": 1, "limit": limit, "offset": offset})
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/search/get?{query}"))
-        result = payload.get("result") or {}
-        liked = self.liked_ids()
-        songs = [_song_view(item, liked) for item in result.get("songs") or []]
-        return {"songs": songs, "song_count": int(result.get("songCount") or len(songs)), "offset": offset, "limit": limit}
-
-    def song(self, song_id: int) -> dict[str, Any]:
-        encoded = urllib.parse.quote(json.dumps([song_id], separators=(",", ":")))
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/song/detail?ids={encoded}"))
-        songs = payload.get("songs") or []
-        if not songs:
-            raise MusicError(404, "song not found")
-        return _song_view(songs[0], self.liked_ids())
-
-    def play_source(self, song_id: int) -> dict[str, Any]:
-        modern_data = {
-            "ids": json.dumps([song_id], separators=(",", ":")),
-            "level": "standard",
-            "encodeType": "mp3",
-        }
-        try:
-            payload = _upstream_ok(self.request(
-                "https://music.163.com/api/song/enhance/player/url/v1",
+def _patched_play_source(self, song_id: int) -> dict[str, Any]:
+    modern_data = {
+        "ids": json.dumps([song_id], separators=(",", ":")),
+        "level": "standard",
+        "encodeType": "mp3",
+    }
+    try:
+        if self.request is _core.netease_request:
+            eapi_data = {**modern_data, "encodeType": "flac"}
+            payload = _core._upstream_ok(_eapi_json("/song/enhance/player/url/v1", eapi_data))
+            transport = "eapi"
+        else:
+            payload = _core._upstream_ok(self.request(
+                "https://interface3.music.163.com/eapi/song/enhance/player/url/v1",
                 data=modern_data,
             ))
-            data = (payload.get("data") or [None])[0] or {}
-        except MusicError:
-            data = {}
+            transport = "test"
+        data = (payload.get("data") or [None])[0] or {}
+    except _core.MusicError:
+        data = {}
+        transport = "legacy"
 
+    raw = str(data.get("url") or "").strip()
+    source_kind = "v1"
+    if not raw:
+        query = urllib.parse.urlencode({
+            "id": song_id,
+            "ids": json.dumps([song_id], separators=(",", ":")),
+            "br": 320000,
+        })
+        payload = _core._upstream_ok(self.request(f"https://music.163.com/api/song/enhance/player/url?{query}"))
+        data = (payload.get("data") or [None])[0] or {}
         raw = str(data.get("url") or "").strip()
-        source_kind = "v1"
-        if not raw:
-            query = urllib.parse.urlencode({
-                "id": song_id,
-                "ids": json.dumps([song_id], separators=(",", ":")),
-                "br": 320000,
-            })
-            payload = _upstream_ok(self.request(f"https://music.163.com/api/song/enhance/player/url?{query}"))
-            data = (payload.get("data") or [None])[0] or {}
-            raw = str(data.get("url") or "").strip()
-            source_kind = "legacy"
-        if not raw:
-            raise MusicError(409, "playable source is unavailable")
-        https_url = raw.replace("http://", "https://", 1) if raw.startswith("http://") else raw
-        return {
-            "track_id": song_id,
-            "url": https_url,
-            "bitrate": int(data.get("br") or 0),
-            "expire_seconds": int(data.get("expi") or 0),
-            "format": str(data.get("type") or ""),
-            "level": str(data.get("level") or ("standard" if source_kind == "v1" else "")),
-            "source_kind": source_kind,
-            "song": self.song(song_id),
-        }
-
-    def lyric(self, song_id: int) -> dict[str, Any]:
-        query = urllib.parse.urlencode({"id": song_id, "lv": -1, "tv": -1, "kv": -1})
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/song/lyric?{query}"))
-        lyric = str((payload.get("lrc") or {}).get("lyric") or "")
-        translated = str((payload.get("tlyric") or {}).get("lyric") or "")
-        lines = parse_lrc(lyric)
-        return {
-            "track_id": song_id,
-            "lyric": lyric[:20_000] or None,
-            "translated_lyric": translated[:20_000] or None,
-            "lines": lines,
-        }
+        source_kind = "legacy"
+        transport = "legacy"
+    if not raw:
+        raise _core.MusicError(409, "playable source is unavailable")
+    return {
+        "track_id": song_id,
+        "url": raw.replace("http://", "https://", 1) if raw.startswith("http://") else raw,
+        "bitrate": int(data.get("br") or 0),
+        "expire_seconds": int(data.get("expi") or 0),
+        "format": str(data.get("type") or ""),
+        "level": str(data.get("level") or ("standard" if source_kind == "v1" else "")),
+        "source_kind": source_kind,
+        "transport": transport,
+        "song": self.song(song_id),
+    }
 
 
-MUSIC = NetEaseMusic()
-LISTENING = ListeningStore()
+def _audio_signature(secret: str, song_id: int, expires: int) -> str:
+    message = f"audio:{song_id}:{expires}".encode("ascii")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()[:32]
 
 
-def get_csrf():
-    for part in NETEASE_COOKIE.split(";"):
-        part = part.strip()
-        if part.startswith("__csrf="):
-            return part.split("=", 1)[1]
-    return ""
+def _signed_audio_path(secret: str, song_id: int, *, now: int | None = None) -> str:
+    timestamp = int(time.time() if now is None else now)
+    expires = timestamp + _AUDIO_TTL_SECONDS
+    return f"/v1/audio/{song_id}/{expires}/{_audio_signature(secret, song_id, expires)}"
 
 
-def play_music(query, note=None):
-    try:
-        songs = MUSIC.search(str(query or "").strip(), 5)["songs"]
-        if not songs:
-            return "No results for '" + str(query) + "'"
-        song = songs[0]
-        return "[music:{}:{}:{}:{}]{}".format(song["id"], song["name"].replace(":", "："), ", ".join(song["artists"]).replace(":", "："), song["cover_url"], note or "")
-    except MusicError as error:
-        return "Failed: " + error.message
-
-
-def create_playlist(name, description="", privacy=0):
-    url = "https://music.163.com/api/playlist/create?csrf_token=" + urllib.parse.quote(get_csrf())
-    data = {"name": name, "privacy": str(privacy), "type": "NORMAL"}
-    if description:
-        data["description"] = description
-    try:
-        response = _upstream_ok(netease_request(url, data=data))
-        return "Created playlist '{}' (ID: {})".format(name, (response.get("playlist") or {}).get("id"))
-    except MusicError as error:
-        return "Failed: " + error.message
-
-
-def _playlist_tracks(operation, playlist_id, song_ids):
-    values = [value.strip() for value in str(song_ids).split(",") if value.strip()]
-    if not values or not all(value.isdigit() for value in values):
-        return "Failed: invalid song IDs"
-    url = "https://music.163.com/api/playlist/manipulate/tracks?csrf_token=" + urllib.parse.quote(get_csrf())
-    data = {"op": operation, "pid": str(playlist_id), "trackIds": json.dumps([int(value) for value in values])}
-    try:
-        response = netease_request(url, data=data)
-        if response.get("code") == 502 and operation == "add":
-            return "Song already in playlist"
-        _upstream_ok(response)
-        verb = "Added" if operation == "add" else "Removed"
-        return f"{verb} {len(values)} song(s) {'to' if operation == 'add' else 'from'} playlist {playlist_id}"
-    except MusicError as error:
-        return "Failed: " + error.message
-
-
-def add_to_playlist(playlist_id, song_ids):
-    return _playlist_tracks("add", playlist_id, song_ids)
-
-
-def remove_from_playlist(playlist_id, song_ids):
-    return _playlist_tracks("del", playlist_id, song_ids)
-
-
-def list_my_playlists():
-    try:
-        playlists = MUSIC.playlists()["playlists"]
-        if not playlists:
-            return "No playlists found"
-        return "\n".join(f"ID:{item['id']} | {item['name']} | {item['track_count']} songs {'(mine)' if item['owned'] else '(collected)'}" for item in playlists)
-    except MusicError as error:
-        return "Failed: " + error.message
-
-
-def get_playlist_songs(playlist_id):
-    try:
-        result = MUSIC.playlist(int(playlist_id), 50)
-        songs = result["songs"]
-        if not songs:
-            return f"Playlist {playlist_id} is empty"
-        lines = [f"Playlist: {result['playlist']['name']} ({result['playlist']['track_count']} songs)"]
-        lines.extend(f"{index}. {song['name']} - {', '.join(song['artists'])} (ID:{song['id']})" for index, song in enumerate(songs, 1))
-        return "\n".join(lines)
-    except (MusicError, TypeError, ValueError) as error:
-        return "Failed: " + (error.message if isinstance(error, MusicError) else "invalid playlist ID")
-
-
-def get_play_history(limit=30, all_time=False):
-    try:
-        songs = MUSIC.history(max(1, min(int(limit), 100)), bool(all_time))["songs"]
-        if not songs:
-            return "No play history found"
-        lines = ["Recent play history:"]
-        lines.extend(f"{index}. {song['name']} - {', '.join(song['artists'])} (plays:{song['play_count']}, ID:{song['id']})" for index, song in enumerate(songs, 1))
-        return "\n".join(lines)
-    except (MusicError, TypeError, ValueError) as error:
-        return "Failed: " + (error.message if isinstance(error, MusicError) else "invalid limit")
-
-
-def like_song(song_id, like=True):
-    query = urllib.parse.urlencode({"alg": "itembased", "trackId": song_id, "like": "true" if like else "false", "time": 25, "csrf_token": get_csrf()})
-    try:
-        _upstream_ok(netease_request("https://music.163.com/api/radio/like?" + query))
-        return ("Liked" if like else "Unliked") + " song " + str(song_id)
-    except MusicError as error:
-        return "Failed: " + error.message
-
-
-def daily_recommend():
-    try:
-        songs = MUSIC.recommendations()["songs"]
-        if not songs:
-            return "No daily recommendations found"
-        lines = ["Today's recommendations:"]
-        for index, song in enumerate(songs, 1):
-            line = f"{index}. {song['name']} - {', '.join(song['artists'])} (ID:{song['id']})"
-            if song.get("reason"):
-                line += " [" + song["reason"] + "]"
-            lines.append(line)
-        return "\n".join(lines)
-    except MusicError as error:
-        return "Failed: " + error.message
-
-
-TOOLS = [
-    {"name": "play_music", "description": "Search and play a song from NetEase Cloud Music.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "note": {"type": "string"}}, "required": ["query"]}},
-    {"name": "create_playlist", "description": "Create a new playlist in NetEase account.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "description": {"type": "string"}, "privacy": {"type": "integer"}}, "required": ["name"]}},
-    {"name": "add_to_playlist", "description": "Add song(s) to a playlist.", "inputSchema": {"type": "object", "properties": {"playlist_id": {"type": "integer"}, "song_ids": {"type": "string"}}, "required": ["playlist_id", "song_ids"]}},
-    {"name": "remove_from_playlist", "description": "Remove song(s) from a playlist.", "inputSchema": {"type": "object", "properties": {"playlist_id": {"type": "integer"}, "song_ids": {"type": "string"}}, "required": ["playlist_id", "song_ids"]}},
-    {"name": "list_my_playlists", "description": "List all playlists of the logged-in user.", "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "get_playlist_songs", "description": "Get songs in a playlist.", "inputSchema": {"type": "object", "properties": {"playlist_id": {"type": "integer"}}, "required": ["playlist_id"]}},
-    {"name": "get_play_history", "description": "Get real NetEase play history.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer"}, "all_time": {"type": "boolean"}}}},
-    {"name": "like_song", "description": "Like or unlike a song.", "inputSchema": {"type": "object", "properties": {"song_id": {"type": "integer"}, "like": {"type": "boolean"}}, "required": ["song_id"]}},
-    {"name": "daily_recommend", "description": "Get today's personalized recommendations.", "inputSchema": {"type": "object", "properties": {}}},
-]
-
-
-def handle_jsonrpc(body):
-    method = body.get("method", "")
-    request_id = body.get("id")
-    if method == "initialize":
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "netease-music-mcp", "version": "2.1.0"}}}
-    if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"tools": TOOLS}}
-    if method == "tools/call":
-        name = body.get("params", {}).get("name", "")
-        arguments = body.get("params", {}).get("arguments", {})
-        handlers = {
-            "play_music": lambda: play_music(arguments.get("query", ""), arguments.get("note")),
-            "create_playlist": lambda: create_playlist(arguments.get("name", ""), arguments.get("description", ""), arguments.get("privacy", 0)),
-            "add_to_playlist": lambda: add_to_playlist(arguments.get("playlist_id"), arguments.get("song_ids", "")),
-            "remove_from_playlist": lambda: remove_from_playlist(arguments.get("playlist_id"), arguments.get("song_ids", "")),
-            "list_my_playlists": list_my_playlists,
-            "get_playlist_songs": lambda: get_playlist_songs(arguments.get("playlist_id")),
-            "get_play_history": lambda: get_play_history(arguments.get("limit", 30), arguments.get("all_time", False)),
-            "like_song": lambda: like_song(arguments.get("song_id"), arguments.get("like", True)),
-            "daily_recommend": daily_recommend,
-        }
-        if name not in handlers:
-            return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Unknown tool"}}
-        return {"jsonrpc": "2.0", "id": request_id, "result": {"content": [{"type": "text", "text": handlers[name]()}]}}
-    if method.startswith("notifications/"):
+def _verify_audio_path(secret: str, path: str, *, now: int | None = None) -> int | None:
+    match = _AUDIO_PATH_RE.fullmatch(path)
+    if not match or not secret:
         return None
-    return {"jsonrpc": "2.0", "id": request_id, "error": {"code": -32601, "message": "Unknown method"}}
+    song_id = int(match.group(1))
+    expires = int(match.group(2))
+    timestamp = int(time.time() if now is None else now)
+    if expires < timestamp or expires > timestamp + _AUDIO_MAX_FUTURE_SECONDS:
+        return None
+    expected = _audio_signature(secret, song_id, expires)
+    if not hmac.compare_digest(match.group(3), expected):
+        return None
+    return song_id
 
 
-def _server_time():
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+def _public_origin(handler) -> str:
+    host = (handler.headers.get("Host") or "").strip()
+    if not _HOST_RE.fullmatch(host):
+        raise _core.MusicError(400, "invalid host")
+    hostname = host.split(":", 1)[0].lower()
+    scheme = "http" if hostname in {"127.0.0.1", "localhost"} else "https"
+    return f"{scheme}://{host}"
 
 
-def _integer(query: dict[str, list[str]], name: str, default: int, minimum: int, maximum: int) -> int:
-    values = query.get(name)
-    if values is None:
-        return default
-    if len(values) != 1 or not values[0].isdigit():
-        raise MusicError(400, f"invalid {name}")
-    value = int(values[0])
-    if value < minimum or value > maximum:
-        raise MusicError(400, f"invalid {name}")
-    return value
+_original_read_route = _core.MCPHandler._read_route
+_original_do_get = _core.MCPHandler.do_GET
 
 
-class MCPHandler(http.server.BaseHTTPRequestHandler):
-    music = MUSIC
-    listening = LISTENING
-    service_token = NETEASE_SERVICE_TOKEN
-
-    def _authorized(self):
-        if not self.service_token:
-            raise MusicError(503, "music service authentication is not configured")
-        if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + self.service_token):
-            raise MusicError(401, "unauthorized")
-
-    def _json_response(self, data, status=200):
-        payload = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Cache-Control", "private, no-store")
-        self.send_header("Mcp-Session-Id", SESSION_ID)
-        self.end_headers()
-        self.wfile.write(payload)
-
-    def _error(self, error):
-        self._json_response({"error": error.message, "server_time": _server_time()}, error.status)
-
-    def do_OPTIONS(self):
-        self.send_response(405)
-        self.send_header("Allow", "GET, POST")
-        self.end_headers()
-
-    def do_GET(self):
-        try:
-            parsed = urllib.parse.urlsplit(self.path)
-            if parsed.path == "/health" and not parsed.query:
-                self._json_response({"status": "ok", "tools": len(TOOLS)})
-                return
-            self._authorized()
-            if parsed.path == "/sse" and not parsed.query:
-                self._handle_sse()
-                return
-            query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
-            result = self._read_route(parsed.path, query)
-            result["server_time"] = _server_time()
-            self._json_response(result)
-        except (MusicError, ListeningError) as error:
-            self._error(error)
-
-    def _handle_sse(self):
-        """Keep the repository's legacy MCP SSE transport, now authenticated."""
-        self.send_response(200)
-        self.send_header("Content-Type", "text/event-stream")
-        self.send_header("Cache-Control", "no-cache")
-        self.send_header("Mcp-Session-Id", SESSION_ID)
-        self.end_headers()
-        self.wfile.write(b"event: endpoint\ndata: /message\n\n")
-        self.wfile.flush()
-        try:
-            while True:
-                time.sleep(30)
-                self.wfile.write(b": keepalive\n\n")
-                self.wfile.flush()
-        except (BrokenPipeError, ConnectionResetError):
-            pass
-
-    def _read_route(self, path, query):
-        if path == "/v1/account" and not query:
-            return {"account": self.music.account()}
-        if path == "/v1/history":
-            if set(query) - {"limit", "period"}:
-                raise MusicError(400, "unknown query parameter")
-            limit = _integer(query, "limit", 30, 1, 100)
-            period = query.get("period", ["week"])
-            if len(period) != 1 or period[0] not in {"week", "all"}:
-                raise MusicError(400, "invalid period")
-            return self.music.history(limit, period[0] == "all")
-        if path == "/v1/playlists":
-            if set(query) - {"limit", "offset"}:
-                raise MusicError(400, "unknown query parameter")
-            return self.music.playlists(_integer(query, "limit", 50, 1, 100), _integer(query, "offset", 0, 0, 10000))
-        match = re.fullmatch(r"/v1/playlists/([1-9][0-9]{0,19})", path)
-        if match:
-            if set(query) - {"limit", "offset"}:
-                raise MusicError(400, "unknown query parameter")
-            return self.music.playlist(int(match.group(1)), _integer(query, "limit", 100, 1, 100), _integer(query, "offset", 0, 0, 100000))
-        if path == "/v1/recommendations/daily" and not query:
-            return self.music.recommendations()
-        if path == "/v1/search":
-            if set(query) - {"q", "limit", "offset"}:
-                raise MusicError(400, "unknown query parameter")
-            values = query.get("q")
-            if not values or len(values) != 1 or not values[0].strip() or len(values[0]) > 100:
-                raise MusicError(400, "q must be 1-100 characters")
-            return self.music.search(values[0].strip(), _integer(query, "limit", 20, 1, 30), _integer(query, "offset", 0, 0, 10000))
-        play = re.fullmatch(r"/v1/songs/([1-9][0-9]{0,19})/play", path)
-        if play:
-            if query:
-                raise MusicError(400, "unknown query parameter")
-            return self.music.play_source(int(play.group(1)))
-        lyric = re.fullmatch(r"/v1/songs/([1-9][0-9]{0,19})/lyric", path)
-        if lyric:
-            if query:
-                raise MusicError(400, "unknown query parameter")
-            payload = self.music.lyric(int(lyric.group(1)))
-            payload.pop("lines", None)
-            return payload
-        if path == "/v1/listening":
-            if set(query) - {"include"}:
-                raise MusicError(400, "unknown query parameter")
-            include = query.get("include", ["session"])
-            if len(include) != 1 or include[0] not in {"session", "lyric_window"}:
-                raise MusicError(400, "invalid include")
-            return self.listening.snapshot(include_lyric=include[0] == "lyric_window")
-        raise MusicError(404, "not found")
-
-    def do_POST(self):
-        try:
-            parsed = urllib.parse.urlsplit(self.path)
-            if parsed.query:
-                raise MusicError(404, "not found")
-            if parsed.path == "/v1/listening":
-                self._authorized()
-                self._json_response(self._write_listening())
-                return
-            if parsed.path not in {"/mcp", "/message"}:
-                raise MusicError(404, "not found")
-            self._authorized()
-            if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-                raise MusicError(415, "application/json is required")
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-            except ValueError as error:
-                raise MusicError(400, "invalid content length") from error
-            if length < 1 or length > MAX_REQUEST_BYTES:
-                raise MusicError(413 if length > MAX_REQUEST_BYTES else 400, "invalid request size")
-            try:
-                body = json.loads(self.rfile.read(length))
-            except (json.JSONDecodeError, UnicodeDecodeError) as error:
-                raise MusicError(400, "invalid JSON") from error
-            if not isinstance(body, dict):
-                raise MusicError(400, "JSON-RPC body must be an object")
-            if body.get("method", "").startswith("notifications/") or body.get("id") is None:
-                self.send_response(204)
-                self.end_headers()
-                return
-            self._json_response(handle_jsonrpc(body))
-        except (MusicError, ListeningError) as error:
-            self._error(error)
-
-    def _read_json_body(self):
-        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
-            raise MusicError(415, "application/json is required")
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError as error:
-            raise MusicError(400, "invalid content length") from error
-        if length < 1 or length > MAX_REQUEST_BYTES:
-            raise MusicError(413 if length > MAX_REQUEST_BYTES else 400, "invalid request size")
-        try:
-            body = json.loads(self.rfile.read(length))
-        except (json.JSONDecodeError, UnicodeDecodeError) as error:
-            raise MusicError(400, "invalid JSON") from error
-        if not isinstance(body, dict):
-            raise MusicError(400, "JSON body must be an object")
-        return body
-
-    def _write_listening(self):
-        body = self._read_json_body()
-        lyrics = None
-        action = str(body.get("action") or "")
-        if action in {"play", "next", "previous"}:
-            track = body.get("track") if isinstance(body.get("track"), dict) else body
-            try:
-                track_id = int((track or {}).get("id") or (track or {}).get("track_id") or 0)
-            except (TypeError, ValueError):
-                track_id = 0
-            if action == "play" and track_id < 1:
-                raise MusicError(400, "track is required")
-            if action in {"next", "previous"}:
-                current = self.listening.snapshot().get("listening") or {}
-                queue = current.get("queue") or []
-                index = int(current.get("queue_index") or 0)
-                if action == "next":
-                    index = min(len(queue) - 1, index + 1) if queue else 0
-                else:
-                    index = max(0, index - 1)
-                if queue:
-                    track_id = int(queue[index]["id"])
-            if track_id >= 1:
-                try:
-                    lyrics = self.music.lyric(track_id)
-                except MusicError:
-                    lyrics = None
-                if action == "play" and not (isinstance(body.get("track"), dict) and body["track"].get("name")):
-                    try:
-                        body = dict(body)
-                        body["track"] = self.music.song(track_id)
-                    except MusicError:
-                        pass
-        result = self.listening.apply(body, lyrics)
-        result["server_time"] = _server_time()
-        return result
-
-    def log_message(self, format, *args):
-        pass
+def _patched_read_route(self, path, query):
+    result = _original_read_route(self, path, query)
+    if re.fullmatch(r"/v1/songs/[1-9][0-9]{0,19}/play", path):
+        song_id = int(result.get("track_id") or 0)
+        if song_id < 1 or not self.service_token:
+            raise _core.MusicError(503, "music service authentication is not configured")
+        result = dict(result)
+        result["url"] = _public_origin(self) + _signed_audio_path(self.service_token, song_id)
+    return result
 
 
-class ThreadedHTTPServer(HTTPServer):
-    def process_request(self, request, client_address):
-        thread = threading.Thread(target=self._handle, args=(request, client_address), daemon=True)
-        thread.start()
+def _send_audio_redirect(self, target: str) -> None:
+    self.send_response(302)
+    self.send_header("Location", target)
+    self.send_header("Referrer-Policy", "no-referrer")
+    self.send_header("Cache-Control", "private, no-store")
+    self.send_header("Access-Control-Allow-Origin", "*")
+    self.send_header("Content-Length", "0")
+    self.end_headers()
 
-    def _handle(self, request, client_address):
-        try:
-            self.finish_request(request, client_address)
-        finally:
-            self.shutdown_request(request)
+
+def _patched_do_get(self):
+    parsed = urllib.parse.urlsplit(self.path)
+    if parsed.query:
+        return _original_do_get(self)
+    song_id = _verify_audio_path(self.service_token, parsed.path)
+    if song_id is None:
+        if parsed.path.startswith("/v1/audio/"):
+            self._json_response({"error": "invalid or expired audio link", "server_time": _core._server_time()}, 403)
+            return
+        return _original_do_get(self)
+    try:
+        source = self.music.play_source(song_id)
+        target = str(source.get("url") or "")
+        if not target.startswith("https://"):
+            raise _core.MusicError(502, "invalid playback source")
+        _send_audio_redirect(self, _browser_cdn_url(target))
+    except (_core.MusicError, _core.ListeningError) as error:
+        self._error(error)
+
+
+_core.NetEaseMusic.play_source = _patched_play_source
+_core.MCPHandler._read_route = _patched_read_route
+_core.MCPHandler.do_GET = _patched_do_get
+_core.MCPHandler.music = _core.MUSIC
+
+# Keep the original import surface for existing tests and callers.
+for _name, _value in vars(_core).items():
+    if _name not in {"__name__", "__file__", "__package__", "__loader__", "__spec__"}:
+        globals().setdefault(_name, _value)
 
 
 if __name__ == "__main__":
-    if not NETEASE_COOKIE or not NETEASE_SERVICE_TOKEN:
+    if not _core.NETEASE_COOKIE or not _core.NETEASE_SERVICE_TOKEN:
         raise SystemExit("NETEASE_COOKIE and NETEASE_SERVICE_TOKEN are required")
-    print("NetEase Music MCP v2.1 on port " + str(PORT))
-    print("Tools: " + str(len(TOOLS)))
-    ThreadedHTTPServer(("0.0.0.0", PORT), MCPHandler).serve_forever()
+    print("NetEase Music MCP v2.1 on port " + str(_core.PORT))
+    print("Tools: " + str(len(_core.TOOLS)))
+    _core.ThreadedHTTPServer(("0.0.0.0", _core.PORT), _core.MCPHandler).serve_forever()
