@@ -127,7 +127,10 @@ class StructuredMusicTests(unittest.TestCase):
     def test_existing_write_tools_still_use_the_same_cookie_backed_request(self):
         calls = []
         original = music_server.netease_request
-        music_server.netease_request = lambda url, data=None: calls.append((url, data)) or {"code": 200, "playlist": {"id": 99}}
+        core_original = music_server._core.netease_request
+        fake = lambda url, data=None: calls.append((url, data)) or {"code": 200, "playlist": {"id": 99}}
+        music_server.netease_request = fake
+        music_server._core.netease_request = fake
         try:
             self.assertIn("Created playlist", music_server.create_playlist("共同歌单"))
             self.assertIn("Added 2", music_server.add_to_playlist(99, "11,12"))
@@ -135,6 +138,7 @@ class StructuredMusicTests(unittest.TestCase):
             self.assertEqual(music_server.like_song(11, False), "Unliked song 11")
         finally:
             music_server.netease_request = original
+            music_server._core.netease_request = core_original
         self.assertTrue(any("/api/playlist/create" in url for url, _ in calls))
         self.assertTrue(any(data and data.get("op") == "add" for _, data in calls))
         self.assertTrue(any(data and data.get("op") == "del" for _, data in calls))

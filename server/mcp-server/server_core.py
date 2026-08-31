@@ -661,7 +661,14 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                         pass
         result = self.listening.apply(body, lyrics)
         result["server_time"] = _server_time()
+        try:
+            self._after_listening_write(action, result)
+        except Exception:
+            pass
         return result
+
+    def _after_listening_write(self, action, result):
+        return
 
     def log_message(self, format, *args):
         pass

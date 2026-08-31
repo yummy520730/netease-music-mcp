@@ -11,6 +11,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -22,6 +23,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 _core = importlib.import_module("server_core")
+analysis = importlib.import_module("analysis")
 
 _AES_KEY = b"e82ckenh8dichen8"
 _AUDIO_TTL_SECONDS = 120
@@ -286,9 +288,20 @@ def _public_origin(handler) -> str:
 
 _original_read_route = _core.MCPHandler._read_route
 _original_do_get = _core.MCPHandler.do_GET
+_original_after_listening_write = _core.MCPHandler._after_listening_write
 
 
 def _patched_read_route(self, path, query):
+    analysis_match = re.fullmatch(r"/v1/songs/([1-9][0-9]{0,19})/analysis", path)
+    if analysis_match:
+        if query:
+            raise _core.MusicError(400, "unknown query parameter")
+        if not self.service_token:
+            raise _core.MusicError(503, "music service authentication is not configured")
+        try:
+            return analysis.read_analysis(int(analysis_match.group(1)))
+        except analysis.AnalysisError as error:
+            raise _core.MusicError(error.status, error.message) from error
     result = _original_read_route(self, path, query)
     if re.fullmatch(r"/v1/songs/[1-9][0-9]{0,19}/play", path):
         song_id = int(result.get("track_id") or 0)
@@ -329,9 +342,48 @@ def _patched_do_get(self):
         self._error(error)
 
 
+def _analysis_source_url(music, track_id: int) -> str | None:
+    try:
+        source = music.play_source(int(track_id))
+    except Exception:
+        return None
+    raw = str((source or {}).get("url") or "")
+    target = _browser_cdn_url(raw)
+    if not target.startswith("https://"):
+        return None
+    if any(part in target for part in ("MUSIC_U", "Bearer ", "NETEASE_", "TINGGU_")):
+        return None
+    return target
+
+
+def _ensure_track_analysis(music, track_id: int) -> None:
+    try:
+        url = _analysis_source_url(music, track_id)
+        if not url:
+            return
+        analysis.ensure_analysis(int(track_id), url)
+    except Exception:
+        return
+
+
+def _patched_after_listening_write(self, action, result):
+    if action not in analysis.TRIGGER_ACTIONS:
+        return
+    listening = (result or {}).get("listening") or {}
+    try:
+        track_id = int(listening.get("track_id") or 0)
+    except (TypeError, ValueError):
+        track_id = 0
+    if track_id < 1:
+        return
+    thread = threading.Thread(target=_ensure_track_analysis, args=(self.music, track_id), daemon=True)
+    thread.start()
+
+
 _core.NetEaseMusic.play_source = _patched_play_source
 _core.MCPHandler._read_route = _patched_read_route
 _core.MCPHandler.do_GET = _patched_do_get
+_core.MCPHandler._after_listening_write = _patched_after_listening_write
 _core.MCPHandler.music = _core.MUSIC
 
 # Keep the original import surface for existing tests and callers.
