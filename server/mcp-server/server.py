@@ -230,14 +230,32 @@ class NetEaseMusic:
         return _song_view(songs[0], self.liked_ids())
 
     def play_source(self, song_id: int) -> dict[str, Any]:
-        query = urllib.parse.urlencode({
-            "id": song_id,
+        modern_data = {
             "ids": json.dumps([song_id], separators=(",", ":")),
-            "br": 320000,
-        })
-        payload = _upstream_ok(self.request(f"https://music.163.com/api/song/enhance/player/url?{query}"))
-        data = (payload.get("data") or [None])[0] or {}
+            "level": "standard",
+            "encodeType": "mp3",
+        }
+        try:
+            payload = _upstream_ok(self.request(
+                "https://music.163.com/api/song/enhance/player/url/v1",
+                data=modern_data,
+            ))
+            data = (payload.get("data") or [None])[0] or {}
+        except MusicError:
+            data = {}
+
         raw = str(data.get("url") or "").strip()
+        source_kind = "v1"
+        if not raw:
+            query = urllib.parse.urlencode({
+                "id": song_id,
+                "ids": json.dumps([song_id], separators=(",", ":")),
+                "br": 320000,
+            })
+            payload = _upstream_ok(self.request(f"https://music.163.com/api/song/enhance/player/url?{query}"))
+            data = (payload.get("data") or [None])[0] or {}
+            raw = str(data.get("url") or "").strip()
+            source_kind = "legacy"
         if not raw:
             raise MusicError(409, "playable source is unavailable")
         https_url = raw.replace("http://", "https://", 1) if raw.startswith("http://") else raw
@@ -246,6 +264,9 @@ class NetEaseMusic:
             "url": https_url,
             "bitrate": int(data.get("br") or 0),
             "expire_seconds": int(data.get("expi") or 0),
+            "format": str(data.get("type") or ""),
+            "level": str(data.get("level") or ("standard" if source_kind == "v1" else "")),
+            "source_kind": source_kind,
             "song": self.song(song_id),
         }
 
