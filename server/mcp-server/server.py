@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -16,7 +17,11 @@ import urllib.request
 import uuid
 from datetime import datetime, timezone
 from http.server import HTTPServer
+from pathlib import Path
 from typing import Any, Callable
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from listening import ListeningError, ListeningStore, parse_lrc
 
 NETEASE_COOKIE = os.environ.get("NETEASE_COOKIE", "").strip()
 NETEASE_SERVICE_TOKEN = os.environ.get("NETEASE_SERVICE_TOKEN", "").strip()
@@ -216,8 +221,50 @@ class NetEaseMusic:
         songs = [_song_view(item, liked) for item in result.get("songs") or []]
         return {"songs": songs, "song_count": int(result.get("songCount") or len(songs)), "offset": offset, "limit": limit}
 
+    def song(self, song_id: int) -> dict[str, Any]:
+        encoded = urllib.parse.quote(json.dumps([song_id], separators=(",", ":")))
+        payload = _upstream_ok(self.request(f"https://music.163.com/api/song/detail?ids={encoded}"))
+        songs = payload.get("songs") or []
+        if not songs:
+            raise MusicError(404, "song not found")
+        return _song_view(songs[0], self.liked_ids())
+
+    def play_source(self, song_id: int) -> dict[str, Any]:
+        query = urllib.parse.urlencode({
+            "id": song_id,
+            "ids": json.dumps([song_id], separators=(",", ":")),
+            "br": 320000,
+        })
+        payload = _upstream_ok(self.request(f"https://music.163.com/api/song/enhance/player/url?{query}"))
+        data = (payload.get("data") or [None])[0] or {}
+        raw = str(data.get("url") or "").strip()
+        if not raw:
+            raise MusicError(409, "playable source is unavailable")
+        https_url = raw.replace("http://", "https://", 1) if raw.startswith("http://") else raw
+        return {
+            "track_id": song_id,
+            "url": https_url,
+            "bitrate": int(data.get("br") or 0),
+            "expire_seconds": int(data.get("expi") or 0),
+            "song": self.song(song_id),
+        }
+
+    def lyric(self, song_id: int) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"id": song_id, "lv": -1, "tv": -1, "kv": -1})
+        payload = _upstream_ok(self.request(f"https://music.163.com/api/song/lyric?{query}"))
+        lyric = str((payload.get("lrc") or {}).get("lyric") or "")
+        translated = str((payload.get("tlyric") or {}).get("lyric") or "")
+        lines = parse_lrc(lyric)
+        return {
+            "track_id": song_id,
+            "lyric": lyric[:20_000] or None,
+            "translated_lyric": translated[:20_000] or None,
+            "lines": lines,
+        }
+
 
 MUSIC = NetEaseMusic()
+LISTENING = ListeningStore()
 
 
 def get_csrf():
@@ -396,6 +443,7 @@ def _integer(query: dict[str, list[str]], name: str, default: int, minimum: int,
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
     music = MUSIC
+    listening = LISTENING
     service_token = NETEASE_SERVICE_TOKEN
 
     def _authorized(self):
@@ -436,7 +484,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             result = self._read_route(parsed.path, query)
             result["server_time"] = _server_time()
             self._json_response(result)
-        except MusicError as error:
+        except (MusicError, ListeningError) as error:
             self._error(error)
 
     def _handle_sse(self):
@@ -485,12 +533,37 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             if not values or len(values) != 1 or not values[0].strip() or len(values[0]) > 100:
                 raise MusicError(400, "q must be 1-100 characters")
             return self.music.search(values[0].strip(), _integer(query, "limit", 20, 1, 30), _integer(query, "offset", 0, 0, 10000))
+        play = re.fullmatch(r"/v1/songs/([1-9][0-9]{0,19})/play", path)
+        if play:
+            if query:
+                raise MusicError(400, "unknown query parameter")
+            return self.music.play_source(int(play.group(1)))
+        lyric = re.fullmatch(r"/v1/songs/([1-9][0-9]{0,19})/lyric", path)
+        if lyric:
+            if query:
+                raise MusicError(400, "unknown query parameter")
+            payload = self.music.lyric(int(lyric.group(1)))
+            payload.pop("lines", None)
+            return payload
+        if path == "/v1/listening":
+            if set(query) - {"include"}:
+                raise MusicError(400, "unknown query parameter")
+            include = query.get("include", ["session"])
+            if len(include) != 1 or include[0] not in {"session", "lyric_window"}:
+                raise MusicError(400, "invalid include")
+            return self.listening.snapshot(include_lyric=include[0] == "lyric_window")
         raise MusicError(404, "not found")
 
     def do_POST(self):
         try:
             parsed = urllib.parse.urlsplit(self.path)
-            if parsed.query or parsed.path not in {"/mcp", "/message"}:
+            if parsed.query:
+                raise MusicError(404, "not found")
+            if parsed.path == "/v1/listening":
+                self._authorized()
+                self._json_response(self._write_listening())
+                return
+            if parsed.path not in {"/mcp", "/message"}:
                 raise MusicError(404, "not found")
             self._authorized()
             if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
@@ -512,8 +585,62 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 self.end_headers()
                 return
             self._json_response(handle_jsonrpc(body))
-        except MusicError as error:
+        except (MusicError, ListeningError) as error:
             self._error(error)
+
+    def _read_json_body(self):
+        if self.headers.get("Content-Type", "").split(";", 1)[0].strip().lower() != "application/json":
+            raise MusicError(415, "application/json is required")
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as error:
+            raise MusicError(400, "invalid content length") from error
+        if length < 1 or length > MAX_REQUEST_BYTES:
+            raise MusicError(413 if length > MAX_REQUEST_BYTES else 400, "invalid request size")
+        try:
+            body = json.loads(self.rfile.read(length))
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise MusicError(400, "invalid JSON") from error
+        if not isinstance(body, dict):
+            raise MusicError(400, "JSON body must be an object")
+        return body
+
+    def _write_listening(self):
+        body = self._read_json_body()
+        lyrics = None
+        action = str(body.get("action") or "")
+        if action in {"play", "next", "previous"}:
+            track = body.get("track") if isinstance(body.get("track"), dict) else body
+            try:
+                track_id = int((track or {}).get("id") or (track or {}).get("track_id") or 0)
+            except (TypeError, ValueError):
+                track_id = 0
+            if action == "play" and track_id < 1:
+                raise MusicError(400, "track is required")
+            if action in {"next", "previous"}:
+                current = self.listening.snapshot().get("listening") or {}
+                queue = current.get("queue") or []
+                index = int(current.get("queue_index") or 0)
+                if action == "next":
+                    index = min(len(queue) - 1, index + 1) if queue else 0
+                else:
+                    index = max(0, index - 1)
+                if queue:
+                    track_id = int(queue[index]["id"])
+            if track_id >= 1:
+                try:
+                    lyrics = self.music.lyric(track_id)
+                except MusicError:
+                    lyrics = None
+                if action == "play" and not (isinstance(body.get("track"), dict) and body["track"].get("name")):
+                    try:
+                        body = dict(body)
+                        body["track"] = self.music.song(track_id)
+                    except MusicError:
+                        pass
+        result = self.listening.apply(body, lyrics)
+        result["server_time"] = _server_time()
+        return result
 
     def log_message(self, format, *args):
         pass

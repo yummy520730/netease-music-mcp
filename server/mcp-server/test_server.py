@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import tempfile
 import threading
 import unittest
 import urllib.error
@@ -47,6 +48,14 @@ class FakeUpstream:
             return {"code": 200, "data": {"dailySongs": [] if self.empty else [{**song(), "reason": "猜你喜欢"}]}}
         if "search/get" in url:
             return {"code": 200, "result": {"songs": [] if self.empty else [song()], "songCount": 0 if self.empty else 1}}
+        if "enhance/player/url" in url:
+            if self.empty:
+                return {"code": 200, "data": [{"id": 11, "url": None, "br": 0, "expi": 0}]}
+            return {"code": 200, "data": [{"id": 11, "url": "http://m801.music.126.net/x.mp3", "br": 320000, "expi": 1200}]}
+        if "song/lyric" in url:
+            return {"code": 200, "lrc": {"lyric": "[00:00.00]窗前\n[00:10.00]明月光"}, "tlyric": {"lyric": ""}}
+        if "song/detail" in url:
+            return {"code": 200, "songs": [] if self.empty else [song()]}
         raise AssertionError(url)
 
 
@@ -61,6 +70,10 @@ class StructuredMusicTests(unittest.TestCase):
         self.assertEqual(api.recommendations()["songs"][0]["reason"], "猜你喜欢")
         self.assertEqual(api.search("歌")["song_count"], 1)
         self.assertTrue(any("/api/song/like/get?uid=7" in url for url, _ in upstream.urls))
+        play = api.play_source(11)
+        self.assertTrue(play["url"].startswith("https://"))
+        self.assertNotIn("MUSIC_U", json.dumps(play))
+        self.assertEqual(api.lyric(11)["lines"][0]["text"], "窗前")
 
     def test_empty_lists_are_successful_empty_arrays(self):
         api = music_server.NetEaseMusic(FakeUpstream(empty=True))
@@ -68,6 +81,11 @@ class StructuredMusicTests(unittest.TestCase):
         self.assertEqual(api.history()["songs"], [])
         self.assertEqual(api.recommendations()["songs"], [])
         self.assertEqual(api.search("没有")["songs"], [])
+
+    def test_missing_playable_source_is_a_real_failure(self):
+        with self.assertRaises(music_server.MusicError) as error:
+            music_server.NetEaseMusic(FakeUpstream(empty=True)).play_source(11)
+        self.assertEqual((error.exception.status, error.exception.message), (409, "playable source is unavailable"))
 
     def test_expired_account_and_upstream_errors_are_distinct(self):
         with self.assertRaises(music_server.MusicError) as expired:
@@ -105,10 +123,14 @@ class StubMusic:
     def history(self, limit, all_time): return {"songs": [], "period": "all" if all_time else "week", "limit": limit}
     def recommendations(self): return {"songs": []}
     def search(self, query, limit, offset): return {"songs": [], "song_count": 0, "limit": limit, "offset": offset}
+    def song(self, song_id): return {"id": song_id, "name": "歌", "artists": ["歌手"], "album": "专辑", "cover_url": "", "duration_ms": 1000, "liked": False}
+    def play_source(self, song_id): return {"track_id": song_id, "url": "https://cdn.example/x.mp3", "bitrate": 320000, "expire_seconds": 1200, "song": self.song(song_id)}
+    def lyric(self, song_id): return {"track_id": song_id, "lyric": None, "translated_lyric": None, "lines": []}
 
 
 class Handler(music_server.MCPHandler):
     music = StubMusic()
+    listening = music_server.ListeningStore(Path(tempfile.mkdtemp()) / "listening.json")
     service_token = "service-secret"
 
 
@@ -156,6 +178,28 @@ class HttpContractTests(unittest.TestCase):
 
     def test_legacy_sse_requires_auth(self):
         self.assertEqual(self.request("/sse")[0], 401)
+
+    def test_listening_session_http_contract(self):
+        self.assertEqual(self.request("/v1/listening")[0], 401)
+        status, payload = self.request("/v1/listening", "service-secret")
+        self.assertEqual(status, 200)
+        self.assertIsNone(payload["listening"])
+        body = json.dumps({
+            "action": "play",
+            "playback_owner": "owner-web-1",
+            "track": {"id": 11, "name": "歌", "artists": ["歌手"], "duration_ms": 1000},
+        }).encode()
+        status, payload = self.request("/v1/listening", "service-secret", "POST", body)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["listening"]["track_id"], 11)
+        self.assertNotIn("url", payload["listening"])
+        stale = json.dumps({
+            "action": "heartbeat",
+            "playback_owner": "other-client",
+            "session_id": payload["listening"]["session_id"],
+            "position_ms": 10,
+        }).encode()
+        self.assertEqual(self.request("/v1/listening", "service-secret", "POST", stale)[0], 409)
 
 
 if __name__ == "__main__":
