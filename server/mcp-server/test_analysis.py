@@ -197,15 +197,26 @@ class AnalysisJoinTests(unittest.TestCase):
             return {"status": "queued"}
 
         with mock.patch.object(music_server.analysis, "ensure_analysis", side_effect=capture):
-            self.play()
-            deadline = time.time() + 1
-            while not calls and time.time() < deadline:
+            status, payload = self.play()
+            self.assertEqual(status, 200)
+            session = payload["listening"]["session_id"]
+            for action in ("next", "previous"):
+                body = json.dumps({
+                    "action": action,
+                    "playback_owner": "owner-web-1",
+                    "session_id": session,
+                }).encode()
+                code, _ = self.request("/v1/listening", method="POST", body=body)
+                self.assertEqual(code, 200, action)
+            deadline = time.time() + 1.5
+            while len(calls) < 3 and time.time() < deadline:
                 time.sleep(0.01)
+        self.assertGreaterEqual(len(calls), 3)
         self.assertEqual(calls[0][0], 11)
-        self.assertTrue(calls[0][1].startswith("https://"))
-        self.assertIn("music.126.net", calls[0][1])
-        self.assertNotIn("service-secret", calls[0][1])
-        self.assertNotIn("/v1/audio/", calls[0][1])
+        self.assertTrue(all(url.startswith("https://") for _track, url in calls))
+        self.assertTrue(all("music.126.net" in url for _track, url in calls))
+        self.assertTrue(all("service-secret" not in url for _track, url in calls))
+        self.assertTrue(all("/v1/audio/" not in url for _track, url in calls))
 
     def test_analysis_endpoint_requires_auth(self):
         self.assertEqual(self.request("/v1/songs/11/analysis", token=None)[0], 401)
@@ -247,6 +258,7 @@ class AnalysisJoinTests(unittest.TestCase):
         self.assertNotIn("key_progression", payload["analysis"])
         self.assertNotIn("structure_timeline", payload["analysis"])
         self.assertNotIn("url", payload["analysis"])
+        self.assertNotIn("energy", payload["analysis"])
         self.assertEqual(TingguHandler.requests[-1][0], "GET")
         self.assertIn("key=netease:11", TingguHandler.requests[-1][1])
         self.assertEqual(TingguHandler.requests[-1][2], "Bearer bridge-secret")
@@ -262,6 +274,35 @@ class AnalysisJoinTests(unittest.TestCase):
             self.assertEqual(view["status"], status_name)
             self.assertEqual(view["track_id"], 11)
             self.assertIsNone(view["analysis"])
+            self.assertNotIn("energy", view)
+
+    def test_analysis_http_pending_and_transport_failure(self):
+        TingguHandler.body = {"key": "netease:11", "status": "queued", "version": "shallow-0.4.0"}
+        with mock.patch.object(analysis_mod, "TINGGU_BASE_URL", self.tinggu_base), mock.patch.object(
+            analysis_mod, "TINGGU_BRIDGE_TOKEN", "bridge-secret"
+        ), mock.patch.object(music_server.analysis, "TINGGU_BASE_URL", self.tinggu_base), mock.patch.object(
+            music_server.analysis, "TINGGU_BRIDGE_TOKEN", "bridge-secret"
+        ):
+            status, payload = self.request("/v1/songs/11/analysis")
+            self.assertEqual(status, 200)
+            self.assertEqual(payload["status"], "queued")
+            self.assertIsNone(payload["analysis"])
+            TingguHandler.status = 500
+            code, _ = self.request("/v1/songs/11/analysis")
+            self.assertIn(code, {502, 503})
+        TingguHandler.status = 200
+
+    def test_listening_survives_unpatched_tinggu_http_500(self):
+        TingguHandler.status = 500
+        with mock.patch.object(analysis_mod, "TINGGU_BASE_URL", self.tinggu_base), mock.patch.object(
+            analysis_mod, "TINGGU_BRIDGE_TOKEN", "bridge-secret"
+        ), mock.patch.object(music_server.analysis, "TINGGU_BASE_URL", self.tinggu_base), mock.patch.object(
+            music_server.analysis, "TINGGU_BRIDGE_TOKEN", "bridge-secret"
+        ):
+            status, payload = self.play()
+        TingguHandler.status = 200
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["listening"]["status"], "playing")
 
     def test_ensure_fail_open_and_key_identity(self):
         self.assertEqual(analysis_mod.analysis_key(11), "netease:11")
